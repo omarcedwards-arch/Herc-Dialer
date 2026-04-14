@@ -24,11 +24,13 @@ app.post('/call', async (req, res) => {
   const { leadPhone, leadName } = req.body;
   if (!leadPhone) return res.status(400).json({ error: 'leadPhone required' });
   try {
+    const host = req.get('host');
+    const baseUrl = `https://${host}`;
     const call = await client.calls.create({
       to: MY_CELL,
       from: TWILIO_NUM,
-      url: `${req.protocol}://${req.get('host')}/twiml/connect?leadPhone=${encodeURIComponent(leadPhone)}&leadName=${encodeURIComponent(leadName || 'the company')}`,
-      statusCallback: `${req.protocol}://${req.get('host')}/call-status`,
+      url: `${baseUrl}/twiml/connect?leadPhone=${encodeURIComponent(leadPhone)}&leadName=${encodeURIComponent(leadName || 'the company')}`,
+      statusCallback: `${baseUrl}/call-status`,
       statusCallbackMethod: 'POST',
       statusCallbackEvent: ['completed', 'no-answer', 'busy', 'failed']
     });
@@ -56,10 +58,11 @@ app.post('/voicemail', async (req, res) => {
   if (!leadPhone) return res.status(400).json({ error: 'leadPhone required' });
   const message = vmMessage || "Hi, this is Edwards Carriers calling about heavy equipment transportation. We move equipment nationwide and are heading to your area soon. If you have any equipment that needs to be relocated, please give us a call back. Thank you.";
   try {
+    const host2 = req.get('host');
     const call = await client.calls.create({
       to: leadPhone,
       from: TWILIO_NUM,
-      url: `${req.protocol}://${req.get('host')}/twiml/voicemail?msg=${encodeURIComponent(message)}`
+      url: `https://${host2}/twiml/voicemail?msg=${encodeURIComponent(message)}`
     });
     res.json({ success: true, callSid: call.sid });
   } catch (err) {
