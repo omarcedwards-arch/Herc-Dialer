@@ -19,13 +19,11 @@ const VoiceResponse = twilio.twiml.VoiceResponse;
 app.get('/', (req, res) => res.json({ status: 'Dialer server running', number: TWILIO_NUM }));
 
 // ── 1. Initiate outbound call ──
-// Calls MY_CELL first, when answered connects to lead
 app.post('/call', async (req, res) => {
   const { leadPhone, leadName } = req.body;
   if (!leadPhone) return res.status(400).json({ error: 'leadPhone required' });
   try {
-    const host = req.get('host');
-    const baseUrl = `https://${host}`;
+    const baseUrl = `https://${req.get('host')}`;
     const call = await client.calls.create({
       to: MY_CELL,
       from: TWILIO_NUM,
@@ -58,11 +56,10 @@ app.post('/voicemail', async (req, res) => {
   if (!leadPhone) return res.status(400).json({ error: 'leadPhone required' });
   const message = vmMessage || "Hi, this is Edwards Carriers calling about heavy equipment transportation. We move equipment nationwide and are heading to your area soon. If you have any equipment that needs to be relocated, please give us a call back. Thank you.";
   try {
-    const host2 = req.get('host');
     const call = await client.calls.create({
       to: leadPhone,
       from: TWILIO_NUM,
-      url: `https://${host2}/twiml/voicemail?msg=${encodeURIComponent(message)}`
+      url: `https://${req.get('host')}/twiml/voicemail?msg=${encodeURIComponent(message)}`
     });
     res.json({ success: true, callSid: call.sid });
   } catch (err) {
@@ -81,7 +78,6 @@ app.post('/twiml/voicemail', (req, res) => {
 });
 
 // ── 5. Incoming call forwarding ──
-// Set this URL as your Twilio number webhook so callbacks forward to your cell
 app.post('/incoming', (req, res) => {
   const twiml = new VoiceResponse();
   twiml.say({ voice: 'alice' }, 'Please hold while we connect your call.');
@@ -91,7 +87,34 @@ app.post('/incoming', (req, res) => {
   res.send(twiml.toString());
 });
 
-// ── 6. Call status log ──
+// ── 6. Phone number lookup (mobile vs landline) ──
+// POST /lookup  { phones: ["+15551234567", ...] }
+// Returns { results: { "+15551234567": "mobile", ... } }
+app.post('/lookup', async (req, res) => {
+  const { phones } = req.body;
+  if (!phones || !phones.length) return res.status(400).json({ error: 'phones array required' });
+
+  const results = {};
+  for (const phone of phones) {
+    try {
+      const lookup = await client.lookups.v2.phoneNumbers(phone).fetch({ fields: 'line_type_intelligence' });
+      const lineType = lookup.lineTypeIntelligence && lookup.lineTypeIntelligence.type
+        ? lookup.lineTypeIntelligence.type
+        : 'unknown';
+      // Normalize to mobile / landline / voip / unknown
+      if (lineType === 'mobile' || lineType === 'personal') results[phone] = 'Mobile';
+      else if (lineType === 'landline' || lineType === 'fixedVoip') results[phone] = 'Landline';
+      else if (lineType === 'voip' || lineType === 'nonFixedVoip') results[phone] = 'VoIP';
+      else results[phone] = 'Unknown';
+    } catch (err) {
+      console.error('Lookup error for', phone, ':', err.message);
+      results[phone] = 'Unknown';
+    }
+  }
+  res.json({ success: true, results });
+});
+
+// ── 7. Call status log ──
 app.post('/call-status', (req, res) => {
   console.log('Call status:', req.body.CallStatus, '| SID:', req.body.CallSid, '| To:', req.body.To);
   res.sendStatus(200);
