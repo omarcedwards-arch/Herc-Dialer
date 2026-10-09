@@ -204,4 +204,26 @@ app.post('/search', async (req, res) => {
     if (!items) return res.status(504).json({ error: 'Bright Data timed out. Try again in a minute.', results: [] });
 
     const results = (Array.isArray(items) ? items : [])
-      .filter(it => !it.error && (it.name
+      .filter(it => !it.error && (it.name || it.title))
+      .map(it => ({
+        name:    it.name || it.title || '',
+        phone:   it.phone_number || it.phone || it.international_phone_number || '',
+        address: it.address || it.full_address || '',
+        website: it.open_website || it.website || it.url_website || '',
+        gcat:    it.category || (Array.isArray(it.all_categories) ? it.all_categories[0] : '') || '',
+        mapsUrl: it.google_maps_url || `https://www.google.com/maps/search/${encodeURIComponent((it.name || '') + ' ' + city)}`,
+        placeId: it.place_id || `bd_${snapshotId}_${Math.random().toString(36).slice(2)}`
+      }))
+      .filter(x => x.name);
+
+    console.log(`/search "${keyword}" in "${city}" → ${results.length} results`);
+    res.json({ success: true, results, count: results.length });
+
+  } catch (err) {
+    console.error('BD search error:', err.message);
+    res.status(500).json({ error: err.message, results: [] });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Dialer server running on port ${PORT}`));
