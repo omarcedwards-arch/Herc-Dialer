@@ -87,18 +87,16 @@ app.post('/incoming', (req, res) => {
   res.send(twiml.toString());
 });
 
-// ── 6. Phone number lookup (mobile vs landline) ──
+// ── 6. Phone number lookup ──
 app.post('/lookup', async (req, res) => {
   const { phones } = req.body;
   if (!phones || !phones.length) return res.status(400).json({ error: 'phones array required' });
-
   const results = {};
   for (const phone of phones) {
     try {
       const lookup = await client.lookups.v2.phoneNumbers(phone).fetch({ fields: 'line_type_intelligence' });
       const lineType = lookup.lineTypeIntelligence && lookup.lineTypeIntelligence.type
-        ? lookup.lineTypeIntelligence.type
-        : 'unknown';
+        ? lookup.lineTypeIntelligence.type : 'unknown';
       if (lineType === 'mobile' || lineType === 'personal') results[phone] = 'Mobile';
       else if (lineType === 'landline' || lineType === 'fixedVoip') results[phone] = 'Landline';
       else if (lineType === 'voip' || lineType === 'nonFixedVoip') results[phone] = 'VoIP';
@@ -142,8 +140,10 @@ const CITY_COORDS = {
   'lake placid fl': [27.2939, -81.3637], 'okeechobee fl': [27.2436, -80.8298],
   'belle glade fl': [26.6845, -80.6687], 'pahokee fl': [26.8198, -80.6626],
 };
+
 const cityKey = s => String(s || '').toLowerCase().replace(/[.,]/g, ' ').replace(/\s+/g, ' ').trim();
 const geocodeCache = {};
+
 async function geocode(city) {
   const k = cityKey(city);
   if (CITY_COORDS[k]) return CITY_COORDS[k];
@@ -158,65 +158,95 @@ async function geocode(city) {
   return geocodeCache[k];
 }
 
+async function bdTrigger(BD_API_KEY, lat, lon, keyword, limit) {
+  const triggerUrl = `${BD_BASE}/trigger?dataset_id=${DATASET_ID}&include_errors=true&type=discover_new&discover_by=location&limit_per_input=${limit}`;
+  const r = await fetch(triggerUrl, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${BD_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify([{ country: 'US', lat: String(lat), long: String(lon), zoom_level: '11', keyword }])
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.snapshot_id) throw new Error(`BD trigger failed for "${keyword}": ${d.message || d.error || r.status}`);
+  return d.snapshot_id;
+}
+
+async function bdFetch(BD_API_KEY, snapshotId, maxWaitMs = 90000) {
+  const auth = { 'Authorization': `Bearer ${BD_API_KEY}` };
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 5000));
+    const prog = await (await fetch(`${BD_BASE}/progress/${encodeURIComponent(snapshotId)}`, { headers: auth })).json().catch(() => ({}));
+    if (prog.status === 'failed') throw new Error(`BD job failed: ${prog.error || 'unknown'}`);
+    if (prog.status !== 'ready') continue;
+    const snapRes = await fetch(`${BD_BASE}/snapshot/${encodeURIComponent(snapshotId)}?format=json`, { headers: auth });
+    if (snapRes.status === 202) continue;
+    return await snapRes.json().catch(() => []);
+  }
+  throw new Error('Bright Data timed out');
+}
+
+function normalizeResult(it, city, snapshotId) {
+  return {
+    name:    it.name || it.title || '',
+    phone:   it.phone_number || it.phone || it.international_phone_number || '',
+    address: it.address || it.full_address || '',
+    website: it.open_website || it.website || it.url_website || '',
+    gcat:    it.category || (Array.isArray(it.all_categories) ? it.all_categories[0] : '') || '',
+    mapsUrl: it.google_maps_url || `https://www.google.com/maps/search/${encodeURIComponent((it.name || '') + ' ' + city)}`,
+    placeId: it.place_id || `bd_${snapshotId}_${Math.random().toString(36).slice(2)}`
+  };
+}
+
+// POST /search  { keyword, city }  OR  { keywords: [...], city }
 app.post('/search', async (req, res) => {
-  const { keyword, city } = req.body;
-  if (!keyword || !city) return res.status(400).json({ error: 'keyword and city required' });
+  const city = String(req.body.city || '').trim();
+  const keywords = req.body.keywords
+    ? (Array.isArray(req.body.keywords) ? req.body.keywords : [req.body.keywords])
+    : (req.body.keyword ? [String(req.body.keyword)] : []);
+
+  if (!city || !keywords.length) return res.status(400).json({ error: 'city and keyword(s) required' });
 
   const BD_API_KEY = process.env.BD_API_KEY || process.env.BRIGHTDATA_API_KEY;
   if (!BD_API_KEY) return res.status(500).json({ error: 'BD_API_KEY not set on server' });
 
-  const limit = Math.min(Math.max(Number(req.body.limit) || 50, 1), 200);
+  const limit = Math.min(Math.max(Number(req.body.limit) || 20, 1), 100);
 
   try {
     const [lat, lon] = await geocode(city);
+    console.log(`/search: ${keywords.length} keywords near ${city} (${lat}, ${lon}), limit ${limit} each`);
 
-    const triggerUrl = `${BD_BASE}/trigger?dataset_id=${DATASET_ID}&include_errors=true&type=discover_new&discover_by=location&limit_per_input=${limit}`;
-    const triggerRes = await fetch(triggerUrl, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${BD_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify([{ country: 'US', lat: String(lat), long: String(lon), zoom_level: '11', keyword }])
+    // Trigger ALL keywords in parallel
+    const snapshotIds = await Promise.all(
+      keywords.map(kw => bdTrigger(BD_API_KEY, lat, lon, kw, limit).catch(e => { console.error(e.message); return null; }))
+    );
+    console.log(`Triggered ${snapshotIds.filter(Boolean).length}/${keywords.length} snapshots`);
+
+    // Fetch ALL snapshots in parallel
+    const allItems = await Promise.all(
+      snapshotIds.map((sid, i) => sid
+        ? bdFetch(BD_API_KEY, sid).catch(e => { console.error(`Fetch error for "${keywords[i]}":`, e.message); return []; })
+        : Promise.resolve([])
+      )
+    );
+
+    // Merge and deduplicate by name
+    const seenNames = new Set();
+    const results = [];
+    allItems.forEach((items, i) => {
+      const sid = snapshotIds[i] || 'x';
+      (Array.isArray(items) ? items : [])
+        .filter(it => !it.error && (it.name || it.title))
+        .forEach(it => {
+          const norm = normalizeResult(it, city, sid);
+          if (!norm.name) return;
+          const key = norm.name.toLowerCase().replace(/\s+/g, '');
+          if (seenNames.has(key)) return;
+          seenNames.add(key);
+          results.push(norm);
+        });
     });
-    const triggerData = await triggerRes.json().catch(() => ({}));
-    if (!triggerRes.ok || !triggerData.snapshot_id) {
-      console.error('BD trigger failed:', JSON.stringify(triggerData));
-      return res.status(502).json({ error: `Bright Data trigger failed: ${triggerData.message || triggerData.error || triggerRes.status}` });
-    }
-    const snapshotId = triggerData.snapshot_id;
-    console.log(`BD snapshot started: ${snapshotId} | "${keyword}" near ${city} (${lat}, ${lon})`);
 
-    const auth = { 'Authorization': `Bearer ${BD_API_KEY}` };
-    let items = null;
-    for (let attempt = 0; attempt < 18; attempt++) {
-      await new Promise(r => setTimeout(r, 5000));
-      const prog = await (await fetch(`${BD_BASE}/progress/${encodeURIComponent(snapshotId)}`, { headers: auth })).json().catch(() => ({}));
-      console.log(`BD poll ${attempt + 1}: status=${prog.status}`);
-      if (prog.status === 'failed') {
-        return res.status(502).json({ error: `Bright Data job failed: ${prog.error || 'unknown'}`, results: [] });
-      }
-      if (prog.status !== 'ready') continue;
-
-      const snapRes = await fetch(`${BD_BASE}/snapshot/${encodeURIComponent(snapshotId)}?format=json`, { headers: auth });
-      if (snapRes.status === 202) continue;
-      items = await snapRes.json().catch(() => []);
-      break;
-    }
-
-    if (!items) return res.status(504).json({ error: 'Bright Data timed out. Try again in a minute.', results: [] });
-
-    const results = (Array.isArray(items) ? items : [])
-      .filter(it => !it.error && (it.name || it.title))
-      .map(it => ({
-        name:    it.name || it.title || '',
-        phone:   it.phone_number || it.phone || it.international_phone_number || '',
-        address: it.address || it.full_address || '',
-        website: it.open_website || it.website || it.url_website || '',
-        gcat:    it.category || (Array.isArray(it.all_categories) ? it.all_categories[0] : '') || '',
-        mapsUrl: it.google_maps_url || `https://www.google.com/maps/search/${encodeURIComponent((it.name || '') + ' ' + city)}`,
-        placeId: it.place_id || `bd_${snapshotId}_${Math.random().toString(36).slice(2)}`
-      }))
-      .filter(x => x.name);
-
-    console.log(`/search "${keyword}" in "${city}" → ${results.length} results`);
+    console.log(`/search complete: ${results.length} unique results from ${keywords.length} keywords in ${city}`);
     res.json({ success: true, results, count: results.length });
 
   } catch (err) {
