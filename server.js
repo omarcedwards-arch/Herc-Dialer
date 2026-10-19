@@ -196,7 +196,7 @@ app.post('/search', async (req, res) => {
   const APIFY_KEY = process.env.APIFY_API_KEY;
   if (!APIFY_KEY) return res.status(500).json({ error: 'APIFY_API_KEY not set on server' });
 
-  const limit = Math.min(Math.max(Number(req.body.limit) || 20, 1), 100);
+  const limit = Math.min(Math.max(Number(req.body.limit) || 50, 1), 200);
 
   try {
     console.log(`/search: ${keywords.length} keywords near ${city}, limit ${limit} each`);
