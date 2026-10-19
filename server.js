@@ -87,16 +87,21 @@ app.post('/incoming', (req, res) => {
   res.send(twiml.toString());
 });
 
-// ── 6. Phone number lookup ──
+// ── 6. Phone number lookup (mobile vs landline) ──
+// POST /lookup  { phones: ["+15551234567", ...] }
+// Returns { results: { "+15551234567": "mobile", ... } }
 app.post('/lookup', async (req, res) => {
   const { phones } = req.body;
   if (!phones || !phones.length) return res.status(400).json({ error: 'phones array required' });
+
   const results = {};
   for (const phone of phones) {
     try {
       const lookup = await client.lookups.v2.phoneNumbers(phone).fetch({ fields: 'line_type_intelligence' });
       const lineType = lookup.lineTypeIntelligence && lookup.lineTypeIntelligence.type
-        ? lookup.lineTypeIntelligence.type : 'unknown';
+        ? lookup.lineTypeIntelligence.type
+        : 'unknown';
+      // Normalize to mobile / landline / voip / unknown
       if (lineType === 'mobile' || lineType === 'personal') results[phone] = 'Mobile';
       else if (lineType === 'landline' || lineType === 'fixedVoip') results[phone] = 'Landline';
       else if (lineType === 'voip' || lineType === 'nonFixedVoip') results[phone] = 'VoIP';
@@ -115,89 +120,71 @@ app.post('/call-status', (req, res) => {
   res.sendStatus(200);
 });
 
-// ── 8. Bright Data search — Google Maps Dataset API ──
-const DATASET_ID = 'gd_m8ebnr0q2qlklc02fz';
-const BD_BASE    = 'https://api.brightdata.com/datasets/v3';
+// ── 8. Apify search — Google Maps Scraper (compass/crawler-google-places) ──
+// Runs one Apify actor run per keyword in parallel, polls until done, merges results.
+//
+// POST /search  { keyword: "heavy equipment rental", city: "Dallas, TX" }
+// POST /search  { keywords: [...], city: "Dallas, TX" }
+// Returns { results: [{ name, address, phone, website, mapsUrl }] }
 
-const CITY_COORDS = {
-  'dallas tx': [32.7767, -96.797], 'fort worth tx': [32.7555, -97.3308],
-  'houston tx': [29.7604, -95.3698], 'san antonio tx': [29.4241, -98.4936],
-  'austin tx': [30.2672, -97.7431], 'midland tx': [31.9973, -102.0779],
-  'odessa tx': [31.8457, -102.3676], 'el paso tx': [31.7619, -106.485],
-  'corpus christi tx': [27.8006, -97.3964], 'beaumont tx': [30.0802, -94.1266],
-  'oklahoma city ok': [35.4676, -97.5164], 'tulsa ok': [36.154, -95.9928],
-  'shreveport la': [32.5252, -93.7502], 'baton rouge la': [30.4515, -91.1871],
-  'new orleans la': [29.9511, -90.0715], 'lake charles la': [30.2266, -93.2174],
-  'phoenix az': [33.4484, -112.074], 'denver co': [39.7392, -104.9903],
-  'kansas city mo': [39.0997, -94.5786], 'memphis tn': [35.1495, -90.049],
-  'nashville tn': [36.1627, -86.7816], 'atlanta ga': [33.749, -84.388],
-  'birmingham al': [33.5186, -86.8104], 'charlotte nc': [35.2271, -80.8431],
-  'chicago il': [41.8781, -87.6298], 'detroit mi': [42.3314, -83.0458],
-  'pittsburgh pa': [40.4406, -79.9959], 'philadelphia pa': [39.9526, -75.1652],
-  'los angeles ca': [34.0522, -118.2437], 'orlando fl': [28.5383, -81.3792],
-  'tampa fl': [27.9506, -82.4572], 'jacksonville fl': [30.3322, -81.6557],
-  'miami fl': [25.7617, -80.1918], 'avon park fl': [27.5964, -81.5059],
-  'lake placid fl': [27.2939, -81.3637], 'okeechobee fl': [27.2436, -80.8298],
-  'belle glade fl': [26.6845, -80.6687], 'pahokee fl': [26.8198, -80.6626],
-};
+const APIFY_BASE  = 'https://api.apify.com/v2';
+const APIFY_ACTOR = 'compass~crawler-google-places';
 
-const cityKey = s => String(s || '').toLowerCase().replace(/[.,]/g, ' ').replace(/\s+/g, ' ').trim();
-const geocodeCache = {};
-
-async function geocode(city) {
-  const k = cityKey(city);
-  if (CITY_COORDS[k]) return CITY_COORDS[k];
-  if (geocodeCache[k]) return geocodeCache[k];
-  const r = await fetch(
-    `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=us&q=${encodeURIComponent(city)}`,
-    { headers: { 'User-Agent': 'ECEquipmentLeads/1.0' } }
-  );
-  const d = await r.json().catch(() => []);
-  if (!d[0]) throw new Error(`Couldn't find "${city}". Try "City ST", e.g. "Dallas TX".`);
-  geocodeCache[k] = [Number(d[0].lat), Number(d[0].lon)];
-  return geocodeCache[k];
-}
-
-async function bdTrigger(BD_API_KEY, lat, lon, keyword, limit) {
-  const triggerUrl = `${BD_BASE}/trigger?dataset_id=${DATASET_ID}&include_errors=true&type=discover_new&discover_by=location&limit_per_input=${limit}`;
-  const r = await fetch(triggerUrl, {
+// Trigger one Apify actor run for one keyword+city, return runId
+async function apifyTrigger(apiKey, keyword, city, limit) {
+  const searchQuery = `${keyword} near ${city}`;
+  const r = await fetch(`${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${apiKey}`, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${BD_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify([{ country: 'US', lat: String(lat), long: String(lon), zoom_level: '11', keyword }])
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      searchStringsArray: [searchQuery],
+      maxCrawledPlacesPerSearch: limit,
+      language: 'en',
+      countryCode: 'us',
+      includeHistogram: false,
+      includeOpeningHours: false,
+      includePeopleAlsoSearch: false,
+    })
   });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok || !d.snapshot_id) throw new Error(`BD trigger failed for "${keyword}": ${d.message || d.error || r.status}`);
-  return d.snapshot_id;
+  if (!r.ok || !d.data || !d.data.id) throw new Error(`Apify trigger failed for "${keyword}": ${JSON.stringify(d)}`);
+  return d.data.id;
 }
 
-async function bdFetch(BD_API_KEY, snapshotId, maxWaitMs = 90000) {
-  const auth = { 'Authorization': `Bearer ${BD_API_KEY}` };
+// Poll one run until succeeded, then fetch dataset items
+async function apifyFetch(apiKey, runId, maxWaitMs = 180000) {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 5000));
-    const prog = await (await fetch(`${BD_BASE}/progress/${encodeURIComponent(snapshotId)}`, { headers: auth })).json().catch(() => ({}));
-    if (prog.status === 'failed') throw new Error(`BD job failed: ${prog.error || 'unknown'}`);
-    if (prog.status !== 'ready') continue;
-    const snapRes = await fetch(`${BD_BASE}/snapshot/${encodeURIComponent(snapshotId)}?format=json`, { headers: auth });
-    if (snapRes.status === 202) continue;
-    return await snapRes.json().catch(() => []);
+    await new Promise(r => setTimeout(r, 6000));
+    const r = await fetch(`${APIFY_BASE}/actor-runs/${runId}?token=${apiKey}`);
+    const d = await r.json().catch(() => ({}));
+    const status = d.data && d.data.status;
+    if (status === 'FAILED' || status === 'ABORTED' || status === 'TIMED-OUT')
+      throw new Error(`Apify run ${runId} ended with status: ${status}`);
+    if (status !== 'SUCCEEDED') continue;
+    // Fetch dataset items
+    const datasetId = d.data.defaultDatasetId;
+    const itemsRes = await fetch(`${APIFY_BASE}/datasets/${datasetId}/items?token=${apiKey}&format=json&clean=true`);
+    return await itemsRes.json().catch(() => []);
   }
-  throw new Error('Bright Data timed out');
+  throw new Error('Apify timed out waiting for results');
 }
 
-function normalizeResult(it, city, snapshotId) {
+// Normalize an Apify Google Maps record to our standard shape
+function normalizeResult(it, city) {
   return {
-    name:    it.name || it.title || '',
-    phone:   it.phone_number || it.phone || it.international_phone_number || '',
-    address: it.address || it.full_address || '',
-    website: it.open_website || it.website || it.url_website || '',
-    gcat:    it.category || (Array.isArray(it.all_categories) ? it.all_categories[0] : '') || '',
-    mapsUrl: it.google_maps_url || `https://www.google.com/maps/search/${encodeURIComponent((it.name || '') + ' ' + city)}`,
-    placeId: it.place_id || `bd_${snapshotId}_${Math.random().toString(36).slice(2)}`
+    name:    it.title || it.name || '',
+    phone:   it.phone || it.phoneUnformatted || '',
+    address: it.address || it.street || '',
+    website: it.website || it.url || '',
+    gcat:    (Array.isArray(it.categoryName) ? it.categoryName[0] : it.categoryName) || it.category || '',
+    mapsUrl: it.url || `https://www.google.com/maps/search/${encodeURIComponent((it.title || '') + ' ' + city)}`,
+    placeId: it.placeId || `apify_${Math.random().toString(36).slice(2)}`
   };
 }
 
-// POST /search  { keyword, city }  OR  { keywords: [...], city }
+// POST /search  { keyword, city }           — single keyword (legacy)
+// POST /search  { keywords: [...], city }   — multiple keywords in parallel
 app.post('/search', async (req, res) => {
   const city = String(req.body.city || '').trim();
   const keywords = req.body.keywords
@@ -206,38 +193,36 @@ app.post('/search', async (req, res) => {
 
   if (!city || !keywords.length) return res.status(400).json({ error: 'city and keyword(s) required' });
 
-  const BD_API_KEY = process.env.BD_API_KEY || process.env.BRIGHTDATA_API_KEY;
-  if (!BD_API_KEY) return res.status(500).json({ error: 'BD_API_KEY not set on server' });
+  const APIFY_KEY = process.env.APIFY_API_KEY;
+  if (!APIFY_KEY) return res.status(500).json({ error: 'APIFY_API_KEY not set on server' });
 
   const limit = Math.min(Math.max(Number(req.body.limit) || 20, 1), 100);
 
   try {
-    const [lat, lon] = await geocode(city);
-    console.log(`/search: ${keywords.length} keywords near ${city} (${lat}, ${lon}), limit ${limit} each`);
+    console.log(`/search: ${keywords.length} keywords near ${city}, limit ${limit} each`);
 
     // Trigger ALL keywords in parallel
-    const snapshotIds = await Promise.all(
-      keywords.map(kw => bdTrigger(BD_API_KEY, lat, lon, kw, limit).catch(e => { console.error(e.message); return null; }))
+    const runIds = await Promise.all(
+      keywords.map(kw => apifyTrigger(APIFY_KEY, kw, city, limit).catch(e => { console.error(e.message); return null; }))
     );
-    console.log(`Triggered ${snapshotIds.filter(Boolean).length}/${keywords.length} snapshots`);
+    console.log(`Triggered ${runIds.filter(Boolean).length}/${keywords.length} Apify runs`);
 
-    // Fetch ALL snapshots in parallel
+    // Fetch ALL runs in parallel (each polls independently)
     const allItems = await Promise.all(
-      snapshotIds.map((sid, i) => sid
-        ? bdFetch(BD_API_KEY, sid).catch(e => { console.error(`Fetch error for "${keywords[i]}":`, e.message); return []; })
+      runIds.map((rid, i) => rid
+        ? apifyFetch(APIFY_KEY, rid).catch(e => { console.error(`Fetch error for "${keywords[i]}":`, e.message); return []; })
         : Promise.resolve([])
       )
     );
 
-    // Merge and deduplicate by name
+    // Merge, deduplicate by name
     const seenNames = new Set();
     const results = [];
-    allItems.forEach((items, i) => {
-      const sid = snapshotIds[i] || 'x';
+    allItems.forEach(items => {
       (Array.isArray(items) ? items : [])
-        .filter(it => !it.error && (it.name || it.title))
+        .filter(it => it.title || it.name)
         .forEach(it => {
-          const norm = normalizeResult(it, city, sid);
+          const norm = normalizeResult(it, city);
           if (!norm.name) return;
           const key = norm.name.toLowerCase().replace(/\s+/g, '');
           if (seenNames.has(key)) return;
@@ -250,7 +235,7 @@ app.post('/search', async (req, res) => {
     res.json({ success: true, results, count: results.length });
 
   } catch (err) {
-    console.error('BD search error:', err.message);
+    console.error('Apify search error:', err.message);
     res.status(500).json({ error: err.message, results: [] });
   }
 });
